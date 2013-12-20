@@ -30,3 +30,9 @@
 extern int cf_get_rand_buf(uint8_t *buf, int len);
 extern uint64_t cf_get_rand64();
 extern uint32_t cf_get_rand32();
+/*
+http://lists.cs.uiuc.edu/pipermail/llvmdev/2012-December/057002.html
+*/
+#ifdef OSX
+typedef unsigned uint;
+#endif

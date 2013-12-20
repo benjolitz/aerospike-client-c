@@ -42,7 +42,14 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+
+#ifdef OSX
+     #include <sys/types.h>
+     #include <sys/event.h>
+     #include <sys/time.h>
+#else
 #include <sys/epoll.h>
+#endif
 #include <sys/socket.h>
 
 
@@ -104,7 +111,11 @@ cf_socket_create_nb()
 	}
 
 	int f = 1;
-	setsockopt(fd, SOL_TCP, TCP_NODELAY, &f, sizeof(f));
+	#ifdef OSX
+		setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &f, sizeof(f));
+	#else
+		setsockopt(fd, SOL_TCP, TCP_NODELAY, &f, sizeof(f));
+	#endif
 
 	return fd;
 }
@@ -160,105 +171,203 @@ cf_socket_read_timeout(int fd, uint8_t *buf, size_t buf_len, uint64_t trans_dead
 	size_t pos = 0;
 	uint64_t start = cf_getms();
 
+	#ifdef OSX
+			if (0 > (epoll_fd = kqueue())) {
+			rv = errno;
+			cf_warn("%s: kqueue() failed (errno %d: \"%s\") ~~ Failing!",
+				    ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+			goto Fail;
+		}
+	#else
 	if (0 > (epoll_fd = epoll_create(1))) {
 		rv = errno;
 		cf_warn("%s: epoll_create() failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
 		goto Fail;
 	}
+	#endif
 
-	struct epoll_event event;
-	memset(&event, 0, sizeof(struct epoll_event));
-	event.data.fd = fd;
-	event.events = EPOLLIN;
+	#ifdef OSX
+		struct kevent event;
+		memset(&event, 0, sizeof(struct kevent)); //pad the address of event with 0's.
+		event.ident = fd;
+		event.filter = EVFILT_READ;
+		event.flags = EV_ADD | EV_ENABLE;
 
-	if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event)) {
-		rv = errno;
-		cf_warn("%s: epoll_ctl(ADD) of socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
-		goto Fail;
-	}
+		int num_events;
 
-	do {
-		uint64_t now = cf_getms();
-		if (now > deadline) {
-#ifdef DEBUG_TIME
-			debug_time_printf("socket read timeout 1", try, busy, start, now, deadline);
-#endif
-			rv = ETIMEDOUT;
-			goto Fail;
-		}
 
-		uint64_t ms_left = deadline - now;
+		struct timespec wait_ms = { 0,     /* block for 5 seconds at most */ 
+									1000000 };   /* 1 ms in nanoseconds */
 
-		int nevents = 0;
-		int max_events = 1;
-		int wait_ms = 1;
-		struct epoll_event events[max_events];
-
-		if (0 > (nevents = epoll_wait(epoll_fd, events, max_events, wait_ms))) {
-			if ((rv = errno) == EINTR) {
-				cf_debug("%s: epoll_wait() on socket encountered EINTR ~~ Retrying!", ctx);
-				busy++;
-				goto Retry;
-			} else {
-				cf_warn("%s: epoll_wait() on socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+		do {
+			try++;
+			uint64_t now = cf_getms();
+			if (now > deadline) {
+				#ifdef DEBUG_TIME
+					debug_time_printf("socket read timeout 1", try, busy, start, now, deadline);
+				#endif
+				rv = ETIMEDOUT;
+				goto Fail;
 			}
-			goto Fail;
-		} else {
-			if (nevents == 0) {
-				cf_debug("%s: epoll_wait() returned no events ~~ Retrying!", ctx);
-				busy++;
-				goto Retry;
-			}
-			if (nevents != 1) {
-				cf_warn("%s: epoll_wait() returned %d events ~~ only 1 expected, so ignoring others!", ctx, nevents);
-			}
-			if (events[0].data.fd == fd) {
-				if (events[0].events & EPOLLIN) {
-					cf_debug("%s: epoll_wait() on socket ready for read detected ~~ Succeeding!", ctx);
+			num_events = kevent(epoll_fd, &event, 1, &event, 1, &wait_ms);
+
+
+			if (num_events == -1) {
+				if ((rv = errno) == EINTR) {
+					cf_debug("%s: kevent() on socket encountered EINTR ~~ Retrying!", ctx);
+					busy++;
+					continue;
 				} else {
-					// (Note:  ERR and HUP events are automatically waited for as well.)
-					if (events[0].events & (EPOLLERR | EPOLLHUP)) {
-						cf_debug("%s: epoll_wait() on socket detected failure event 0x%x ~~ Failing!", ctx, events[0].events);
+					cf_warn("%s: kqueue() on socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+				}
+				goto Fail;
+			} else if (num_events == 0) {
+				cf_debug("%s: kevent() on socket encountered an error!! ~~ Retrying!", ctx)
+				continue;
+			} else if (num_events > 0) {
+				if (num_events > 1) {
+					cf_warn("%s: kevent() returned %d events ~~ only 1 expected, so ignoring others!", ctx, num_events);
+				}
+		        if (event.flags & EV_ERROR) {   /* report any error */
+		           if ((rv = event.data) == EINTR) {
+						cf_debug("%s: kevent() on socket encountered EINTR ~~ Retrying!", ctx);
+						continue;
 					} else {
-						cf_warn("%s: epoll_wait() on socket detected non-read events 0x%x ~~ Failing!", ctx, events[0].events);
+						cf_debug("EV_ERROR: %s\n", strerror(event.data));
+						goto Fail;
 					}
+		        }
+		        if (event.flags & EV_EOF) {
+		        	//remote socket has closed.
+		        	rv = EBADF;
+		        	goto Fail;
+		        }
+
+				int r_bytes = read(fd, buf + pos, buf_len - pos);
+
+				if (r_bytes > 0) {
+					pos += r_bytes;
+					if (pos >= buf_len)	{
+						goto Success;
+					}
+				} else if (r_bytes == 0) {
+					// It's likely the socket has been closed on the remote side.
 					rv = EBADF;
 					goto Fail;
+				} else if ((errno != ETIMEDOUT) && (errno != EWOULDBLOCK) && (errno != EINPROGRESS) && (errno != EAGAIN)) {
+					#ifdef DEBUG_TIME
+						debug_time_printf("socket read timeout 2", try, busy, start, now, deadline);
+					#endif
+					rv = errno;
+					goto Fail;
 				}
-			} else {
-				cf_warn("%s: epoll_wait() on socket returned event on unknown socket %d ~~ Retrying!", ctx, events[0].data.fd);
-				goto Retry;
-			}
 
-			int r_bytes = read(fd, buf + pos, buf_len - pos);
-
-			if (r_bytes > 0) {
-				pos += r_bytes;
-				if (pos >= buf_len)	{
-					goto Success;
-				}
-			} else if (r_bytes == 0) {
-				// It's likely the socket has been closed on the remote side.
-				rv = EBADF;
-				goto Fail;
-			} else if ((errno != ETIMEDOUT) && (errno != EWOULDBLOCK) && (errno != EINPROGRESS) && (errno != EAGAIN)) {
-#ifdef DEBUG_TIME
-				debug_time_printf("socket read timeout 2", try, busy, start, now, deadline);
-#endif
-				rv = errno;
-				goto Fail;
 			}
+		} while (pos < buf_len);
+
+	#else
+		struct epoll_event event;
+		memset(&event, 0, sizeof(struct epoll_event));
+		event.data.fd = fd;
+		event.events = EPOLLIN;
+
+		if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event)) {
+			rv = errno;
+			cf_warn("%s: epoll_ctl(ADD) of socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+			goto Fail;
 		}
 
-Retry:
-		try++;
+		do {
+			uint64_t now = cf_getms();
+			if (now > deadline) {
+				#ifdef DEBUG_TIME
+					debug_time_printf("socket read timeout 1", try, busy, start, now, deadline);
+				#endif
+				rv = ETIMEDOUT;
+				goto Fail;
+			}
 
-	} while (pos < buf_len);
+			uint64_t ms_left = deadline - now;
+
+			int nevents = 0;
+			int max_events = 1;
+			int wait_ms = 1;
+			struct epoll_event events[max_events];
+
+			if (0 > (nevents = epoll_wait(epoll_fd, events, max_events, wait_ms))) {
+				if ((rv = errno) == EINTR) {
+					cf_debug("%s: epoll_wait() on socket encountered EINTR ~~ Retrying!", ctx);
+					busy++;
+					goto Retry;
+				} else {
+					cf_warn("%s: epoll_wait() on socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+				}
+				goto Fail;
+			} else {
+				if (nevents == 0) {
+					cf_debug("%s: epoll_wait() returned no events ~~ Retrying!", ctx);
+					busy++;
+					goto Retry;
+				}
+				if (nevents != 1) {
+					cf_warn("%s: epoll_wait() returned %d events ~~ only 1 expected, so ignoring others!", ctx, nevents);
+				}
+				if (events[0].data.fd == fd) {
+					if (events[0].events & EPOLLIN) {
+						cf_debug("%s: epoll_wait() on socket ready for read detected ~~ Succeeding!", ctx);
+					} else {
+						// (Note:  ERR and HUP events are automatically waited for as well.)
+						if (events[0].events & (EPOLLERR | EPOLLHUP)) {
+							cf_debug("%s: epoll_wait() on socket detected failure event 0x%x ~~ Failing!", ctx, events[0].events);
+						} else {
+							cf_warn("%s: epoll_wait() on socket detected non-read events 0x%x ~~ Failing!", ctx, events[0].events);
+						}
+						rv = EBADF;
+						goto Fail;
+					}
+				} else {
+					cf_warn("%s: epoll_wait() on socket returned event on unknown socket %d ~~ Retrying!", ctx, events[0].data.fd);
+					goto Retry;
+				}
+
+				int r_bytes = read(fd, buf + pos, buf_len - pos);
+
+				if (r_bytes > 0) {
+					pos += r_bytes;
+					if (pos >= buf_len)	{
+						goto Success;
+					}
+				} else if (r_bytes == 0) {
+					// It's likely the socket has been closed on the remote side.
+					rv = EBADF;
+					goto Fail;
+				} else if ((errno != ETIMEDOUT) && (errno != EWOULDBLOCK) && (errno != EINPROGRESS) && (errno != EAGAIN)) {
+	#ifdef DEBUG_TIME
+					debug_time_printf("socket read timeout 2", try, busy, start, now, deadline);
+	#endif
+					rv = errno;
+					goto Fail;
+				}
+			}
+
+	Retry:
+			try++;
+
+		} while (pos < buf_len);
+	#endif
 
 Success:
-	if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &event)) {
-		cf_warn("%s: epoll_ctl(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
-	}
+
+    #ifdef OSX
+        event.flags = EV_DISABLE;
+		if (0 > kevent(epoll_fd, &event, 1, NULL, 0, NULL)) {
+			cf_warn("%s: kqueue(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+		}
+    #else
+		if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &event)) {
+			cf_warn("%s: epoll_ctl(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+		}
+    #endif
 	close(epoll_fd);
 
 	rv = 0;
@@ -268,9 +377,16 @@ Fail:
 	cf_debug("%s: socket read timeout fail: %d (%s)", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
 
 	if (epoll_fd > 0) {
-		if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &event)) {
-			cf_warn("%s: epoll_ctl(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
-		}
+		#ifdef OSX
+	        event.flags = EV_DISABLE;
+			if (0 > kevent(epoll_fd, &event, 1, NULL, 0, NULL)) {
+				cf_warn("%s: kqueue(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+			}
+	    #else
+			if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &event)) {
+				cf_warn("%s: epoll_ctl(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+			}
+		#endif
 		close(epoll_fd);
 	}
 
@@ -310,106 +426,196 @@ cf_socket_write_timeout(int fd, uint8_t *buf, size_t buf_len, uint64_t trans_dea
 	int rv = 0, epoll_fd = -1, busy = 0, try = 0;
 	size_t pos = 0;
 	uint64_t start = cf_getms();
-
-	if (0 > (epoll_fd = epoll_create(1))) {
-		rv = errno;
-		cf_warn("%s: epoll_create() failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
-		goto Fail;
-	}
-
-	struct epoll_event event;
-	memset(&event, 0, sizeof(struct epoll_event));
-	event.data.fd = fd;
-	event.events = EPOLLOUT;
-
-	if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event)) {
-		rv = errno;
-		cf_warn("%s: epoll_ctl(ADD) of socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
-		goto Fail;
-	}
-
-	do {
-		uint64_t now = cf_getms();
-		if (now > deadline) {
-#ifdef DEBUG_TIME
-			debug_time_printf("socket write timeout 1", try, busy, start, now, deadline);
-#endif
-			rv = ETIMEDOUT;
+	#ifdef OSX
+		if (0 > (epoll_fd = kqueue())) {
+			rv = errno;
+			cf_warn("%s: kqueue() failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
 			goto Fail;
 		}
-
-		uint64_t ms_left = deadline - now;
-
-		int nevents = 0;
-		int max_events = 1;
-		int wait_ms = 1;
-		struct epoll_event events[max_events];
-
-		if (0 > (nevents = epoll_wait(epoll_fd, events, max_events, wait_ms))) {
-			if ((rv = errno) == EINTR) {
-				cf_debug("%s: epoll_wait() on socket encountered EINTR ~~ Retrying!", ctx);
-				busy++;
-				goto Retry;
-			} else {
-				cf_warn("%s: epoll_wait() on socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
-			}
+	#else
+		if (0 > (epoll_fd = epoll_create(1))) {
+			rv = errno;
+			cf_warn("%s: epoll_create() failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
 			goto Fail;
-		} else {
-			if (nevents == 0) {
-				cf_debug("%s: epoll_wait() returned no events ~~ Retrying!", ctx);
-				busy++;
-				goto Retry;
+		}
+	#endif
+	#ifdef OSX
+		struct kevent event;
+		memset(&event, 0, sizeof(struct kevent)); //pad the address of event with 0's.
+		event.ident = fd;
+		event.filter = EVFILT_WRITE;
+		event.flags = EV_ADD | EV_ENABLE;
+
+		int num_events;
+
+		struct timespec wait_ms = { 0,     /* block for 5 seconds at most */ 
+									1000000 };   /* 1 ms in nanoseconds */
+
+		do {
+			uint64_t now = cf_getms();
+			if (now > deadline) {
+				#ifdef DEBUG_TIME
+					debug_time_printf("socket write timeout 1", try, busy, start, now, deadline);
+				#endif
+				rv = ETIMEDOUT;
+				goto Fail;
 			}
-			if (nevents != 1) {
-				cf_warn("%s: epoll_wait() returned %d events ~~ only 1 expected, so ignoring others!", ctx, nevents);
-			}
-			if (events[0].data.fd == fd) {
-				if (events[0].events & EPOLLOUT) {
-					cf_debug("%s: epoll_wait() on socket ready for write detected ~~ Succeeding!", ctx);
+			uint64_t ms_left = deadline - now;
+
+			num_events = kevent(epoll_fd, &event, 1, &event, 1, &wait_ms);
+
+			if (num_events == -1) {
+				if ((rv = errno) == EINTR) {
+					cf_debug("%s: kevent()write on socket encountered EINTR ~~ Retrying!", ctx);
+					continue;
 				} else {
-					// (Note:  ERR and HUP events are automatically waited for as well.)
-					if (events[0].events & (EPOLLERR | EPOLLHUP)) {
-						cf_debug("%s: epoll_wait() on socket detected failure event 0x%x ~~ Failing!", ctx, events[0].events);
+					cf_warn("%s: kqueue()write on socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+				}
+				goto Fail;
+			} else if (num_events == 0) {
+				cf_debug("%s: kevent()write on socket encountered an error!! ~~ Retrying!", ctx)
+				continue;
+			} else if (num_events > 0) {
+				if (num_events > 1) {
+					cf_warn("%s: kevent()write returned %d events ~~ only 1 expected, so ignoring others!", ctx, num_events);
+				}
+		        if (event.flags & EV_ERROR) {   /* report any error */
+		           if ((rv = event.data) == EINTR) {
+						cf_debug("%s: kevent()write on socket encountered EINTR ~~ Retrying!", ctx);
+						continue;
 					} else {
-						cf_warn("%s: epoll_wait() on socket detected non-write events 0x%x ~~ Failing!", ctx, events[0].events);
+						cf_debug("write EV_ERROR: %s\n", strerror(event.data));
+						goto Fail;
 					}
+		        }
+		        if (event.flags & EV_EOF) {
+		        	//remote socket has closed.
+		        	rv = EBADF;
+		        	goto Fail;
+		        }
+
+				int r_bytes = write(fd, buf + pos, buf_len - pos);
+
+				if (r_bytes > 0) {
+					pos += r_bytes;
+					if (pos >= buf_len)	{
+						goto Success;
+					}
+				} else if (r_bytes == 0) {
+					// It's likely the socket has been closed on the remote side.
 					rv = EBADF;
 					goto Fail;
+				} else if ((errno != ETIMEDOUT) && (errno != EWOULDBLOCK) && (errno != EINPROGRESS) && (errno != EAGAIN)) {
+	#ifdef DEBUG_TIME
+					debug_time_printf("socket write timeout 2", try, busy, start, now, deadline);
+	#endif
+					rv = errno;
+					goto Fail;
 				}
-			} else {
-				cf_warn("%s: epoll_wait() on socket returned event on unknown socket %d ~~ Retrying!", ctx, events[0].data.fd);
-				goto Retry;
 			}
+		} while (pos < buf_len);
+	#else
+		struct epoll_event event;
+		memset(&event, 0, sizeof(struct epoll_event));
+		event.data.fd = fd;
+		event.events = EPOLLOUT;
 
-			int r_bytes = write(fd, buf + pos, buf_len - pos);
-
-			if (r_bytes > 0) {
-				pos += r_bytes;
-				if (pos >= buf_len)	{
-					goto Success;
-				}
-			} else if (r_bytes == 0) {
-				// It's likely the socket has been closed on the remote side.
-				rv = EBADF;
-				goto Fail;
-			} else if ((errno != ETIMEDOUT) && (errno != EWOULDBLOCK) && (errno != EINPROGRESS) && (errno != EAGAIN)) {
-#ifdef DEBUG_TIME
-				debug_time_printf("socket write timeout 2", try, busy, start, now, deadline);
-#endif
-				rv = errno;
-				goto Fail;
-			}
+		if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event)) {
+			rv = errno;
+			cf_warn("%s: epoll_ctl(ADD) of socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+			goto Fail;
 		}
 
-Retry:
-		try++;
+		do {
+			uint64_t now = cf_getms();
+			if (now > deadline) {
+	#ifdef DEBUG_TIME
+				debug_time_printf("socket write timeout 1", try, busy, start, now, deadline);
+	#endif
+				rv = ETIMEDOUT;
+				goto Fail;
+			}
 
-	} while (pos < buf_len);
+			uint64_t ms_left = deadline - now;
+
+			int nevents = 0;
+			int max_events = 1;
+			int wait_ms = 1;
+			struct epoll_event events[max_events];
+
+			if (0 > (nevents = epoll_wait(epoll_fd, events, max_events, wait_ms))) {
+				if ((rv = errno) == EINTR) {
+					cf_debug("%s: epoll_wait() on socket encountered EINTR ~~ Retrying!", ctx);
+					busy++;
+					goto Retry;
+				} else {
+					cf_warn("%s: epoll_wait() on socket failed (errno %d: \"%s\") ~~ Failing!", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+				}
+				goto Fail;
+			} else {
+				if (nevents == 0) {
+					cf_debug("%s: epoll_wait() returned no events ~~ Retrying!", ctx);
+					busy++;
+					goto Retry;
+				}
+				if (nevents != 1) {
+					cf_warn("%s: epoll_wait() returned %d events ~~ only 1 expected, so ignoring others!", ctx, nevents);
+				}
+				if (events[0].data.fd == fd) {
+					if (events[0].events & EPOLLOUT) {
+						cf_debug("%s: epoll_wait() on socket ready for write detected ~~ Succeeding!", ctx);
+					} else {
+						// (Note:  ERR and HUP events are automatically waited for as well.)
+						if (events[0].events & (EPOLLERR | EPOLLHUP)) {
+							cf_debug("%s: epoll_wait() on socket detected failure event 0x%x ~~ Failing!", ctx, events[0].events);
+						} else {
+							cf_warn("%s: epoll_wait() on socket detected non-write events 0x%x ~~ Failing!", ctx, events[0].events);
+						}
+						rv = EBADF;
+						goto Fail;
+					}
+				} else {
+					cf_warn("%s: epoll_wait() on socket returned event on unknown socket %d ~~ Retrying!", ctx, events[0].data.fd);
+					goto Retry;
+				}
+
+				int r_bytes = write(fd, buf + pos, buf_len - pos);
+
+				if (r_bytes > 0) {
+					pos += r_bytes;
+					if (pos >= buf_len)	{
+						goto Success;
+					}
+				} else if (r_bytes == 0) {
+					// It's likely the socket has been closed on the remote side.
+					rv = EBADF;
+					goto Fail;
+				} else if ((errno != ETIMEDOUT) && (errno != EWOULDBLOCK) && (errno != EINPROGRESS) && (errno != EAGAIN)) {
+	#ifdef DEBUG_TIME
+					debug_time_printf("socket write timeout 2", try, busy, start, now, deadline);
+	#endif
+					rv = errno;
+					goto Fail;
+				}
+			}
+
+	Retry:
+			try++;
+
+		} while (pos < buf_len);
+	#endif
 
 Success:
-	if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &event)) {
-		cf_warn("%s: epoll_ctl(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
-	}
+	#ifdef OSX
+        event.flags = EV_DISABLE;
+		if (0 > kevent(epoll_fd, &event, 1, NULL, 0, NULL)) {
+			cf_warn("%s: kqueue(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+		}
+    #else
+		if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &event)) {
+			cf_warn("%s: epoll_ctl(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+		}
+	#endif
 	close(epoll_fd);
 
 	rv = 0;
@@ -419,9 +625,16 @@ Fail:
 	cf_debug("%s: socket write timeout fail: %d (%s)", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
 
 	if (epoll_fd > 0) {
-		if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &event)) {
-			cf_warn("%s: epoll_ctl(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
-		}
+		#ifdef OSX
+	        event.flags = EV_DISABLE;
+			if (0 > kevent(epoll_fd, &event, 1, NULL, 0, NULL)) {
+				cf_warn("%s: kqueue(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+			}
+	    #else
+			if (0 > epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &event)) {
+				cf_warn("%s: epoll_ctl(DEL) on socket failed (errno %d: \"%s\")", ctx, errno, my_strerror_r(errno, errbuf, errbuf_len));
+			}
+		#endif
 		close(epoll_fd);
 	}
 

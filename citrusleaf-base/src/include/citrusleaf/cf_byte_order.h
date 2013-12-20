@@ -29,7 +29,7 @@
 
 #include <libkern/OSByteOrder.h>
 
-#define cf_byteswap64p(_p) (OSSwapBigToHostInt64(*(_p)))
+#define cf_byteswap64p(_p) (OSSwapBigToHostInt64( *(uint64_t *) _p ))
 
 
 #else

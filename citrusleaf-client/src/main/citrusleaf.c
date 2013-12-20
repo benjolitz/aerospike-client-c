@@ -31,7 +31,16 @@
 #include <fcntl.h>
 #include <arpa/inet.h>  // ntonl
 #include <inttypes.h> // PRIu64
+
+#ifdef OSX
+#include <libkern/OSByteOrder.h> // for the 64-bit swap macro.
+#define __swab64(x)      (unsigned long long) OSSwapInt64((uint64_t)x)
+#define __be64_to_cpu(x) (unsigned long long) OSSwapBigToHostInt64((uint64_t)x)
+#define __cpu_to_be64(x) (unsigned long long) OSSwapHostToBigInt64((uint64_t)x)
+#else
 #include <asm/byteorder.h> // 64-bit swap macro
+#endif
+
 #include <signal.h>
 
 #include <citrusleaf/cf_atomic.h>
