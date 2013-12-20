@@ -36,6 +36,9 @@ To build all modules:
 
 	$ make
 
+To build on OSX (this repo):
+       $ make CFLAGS='-DOSX'
+
 To build a specific module:
 
 	$ make -C {module}
