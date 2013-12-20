@@ -1,9 +1,9 @@
 [submodule "msgpack"]
 	path = msgpack
-	url = https://github.com/aerospike/msgpack
+	url = https://github.com/benjolitz/msgpack
 [submodule "aerospike-common"]
 	path = aerospike-common
-	url = https://github.com/aerospike/aerospike-common
+	url = https://github.com/benjolitz/aerospike-common
 [submodule "aerospike-mod-lua"]
 	path = aerospike-mod-lua
-	url = https://github.com/aerospike/aerospike-mod-lua
+	url = https://github.com/benjolitz/aerospike-mod-lua
