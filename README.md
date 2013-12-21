@@ -37,7 +37,8 @@ To build all modules:
 	$ make
 
 To build on OSX (this repo):
-       $ make CFLAGS='-DOSX'
+	   $ brew install lua
+       $ make CFLAGS='-DOSX -I/usr/local/include' LDFLAGS='-L/usr/local/lib -lcrypto -llua -lz'
 
 To build a specific module:
 
