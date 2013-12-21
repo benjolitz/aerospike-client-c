@@ -36,6 +36,13 @@
 #include <citrusleaf/cl_shm.h>
 #include <citrusleaf/cl_request.h>
 
+// EOWNERDEAD is not present in some older platforms.
+#if defined(EOWNERDEAD)
+  extern const int errno_EOWNERDEAD = EOWNERDEAD;
+#else
+  extern const int errno_EOWNERDEAD = -1;
+#endif
+
 bool g_shared_memory;
 
 /* Shared memory global variables */
@@ -194,7 +201,9 @@ int citrusleaf_use_shm(int num_nodes, key_t key)
 		pthread_mutexattr_t attr;
 		pthread_mutexattr_init (&attr);
 		pthread_mutexattr_setpshared (&attr, PTHREAD_PROCESS_SHARED);
-		pthread_mutexattr_setrobust_np(&attr, PTHREAD_MUTEX_ROBUST_NP);
+		#ifndef OSX
+			pthread_mutexattr_setrobust_np(&attr, PTHREAD_MUTEX_ROBUST_NP);
+		#endif
 		if(pthread_mutex_init (&(g_shm_pt->shm_lock), &attr)!=0) {
 			cf_error("Mutex init failed pid %d",getpid());
 			pthread_mutexattr_destroy(&attr);

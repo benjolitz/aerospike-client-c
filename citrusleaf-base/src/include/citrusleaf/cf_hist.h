@@ -22,7 +22,7 @@
 #pragma once
 
 #include <stdint.h>
-
+#include <citrusleaf/cf_clock.h>
 #include <citrusleaf/cf_atomic.h>
 
 /* SYNOPSIS

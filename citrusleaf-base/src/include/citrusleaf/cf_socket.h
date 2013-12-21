@@ -23,7 +23,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
+#include <citrusleaf/cf_clock.h>
 
 #ifndef CF_WINDOWS
 //====================================================================

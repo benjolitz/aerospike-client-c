@@ -911,7 +911,12 @@ cl_cluster_node_fd_create(cl_cluster_node *cn, bool nonblocking)
 	}
 
 	int f = 1;
-	setsockopt(fd, SOL_TCP, TCP_NODELAY, &f, sizeof(f));
+	#ifdef OSX
+		setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &f, sizeof(f));
+	#else
+	 	setsockopt(fd, SOL_TCP, TCP_NODELAY, &f, sizeof(f));
+	#endif
+	
 
 	// loop over all known IP addresses for the server
 	for (uint i=0;i< cf_vector_size(&cn->sockaddr_in_v);i++) {
