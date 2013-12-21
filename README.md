@@ -46,12 +46,7 @@ Please ensure you have resolved the prerequisites and dependencies in the README
 
 To clone this repository, run:
 
-	$ git clone https://github.com/aerospike/aerospike-client-c.git
-
-This repository makes use of git submodules. Before you can build, you need to make sure all submodules are initialized and updated:
-
-	$ cd aerospike-client-c
-	$ git submodule update --init
+	$ git clone --recursive https://github.com/aerospike/aerospike-client-c.git
 
 ### Build
 
